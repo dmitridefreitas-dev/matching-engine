@@ -41,3 +41,7 @@ target_compile_definitions(lob_tests PRIVATE
 
 include(GoogleTest)
 gtest_discover_tests(lob_tests)
+
+# ---- benchmark ---------------------------------------------------------
+add_executable(lob_bench bench/bench_main.cpp)
+target_link_libraries(lob_bench PRIVATE lob)
