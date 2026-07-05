@@ -94,7 +94,9 @@ inline std::vector<FlowOp> load_lobster(const std::string& path, LobsterStats& s
 
         switch (type) {
             case 1: {
-                if (size <= 0 || live.count(id)) { ++stats.skipped; break; }
+                // raw_id 0 is reserved (hidden-order rows use it, and it is
+                // the engines' null-id sentinel) — never submit it.
+                if (size <= 0 || raw_id <= 0 || live.count(id)) { ++stats.skipped; break; }
                 ops.push_back({FlowOp::Kind::Limit, id, side, price,
                                static_cast<Quantity>(size)});
                 live[id] = static_cast<Quantity>(size);
