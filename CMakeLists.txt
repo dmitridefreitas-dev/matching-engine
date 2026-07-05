@@ -33,8 +33,11 @@ enable_testing()
 add_executable(lob_tests
     tests/test_semantics.cpp
     tests/test_equivalence.cpp
+    tests/test_lobster.cpp
 )
 target_link_libraries(lob_tests PRIVATE lob gtest_main)
+target_compile_definitions(lob_tests PRIVATE
+    LOB_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
 include(GoogleTest)
 gtest_discover_tests(lob_tests)
