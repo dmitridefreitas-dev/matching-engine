@@ -8,7 +8,8 @@ Companion to `how-it-works.md` (concepts). This is the code-level defense.
 |---|---|
 | `include/lob/types.hpp` | `Fill`, `LevelSnapshot`, integer tick/qty types |
 | `include/lob/map_book.hpp` | reference engine (`std::map` + `std::list`) |
-| `include/lob/fast_book.hpp` | optimized engine (ladder + pool + intrusive lists) |
+| `include/lob/fast_book.hpp` | optimized engine (ladder + pool + intrusive lists + occupancy bitmap) |
+| `include/lob/id_map.hpp` | open-addressed id→slot map (linear probing, backward-shift deletion) |
 | `include/lob/flow.hpp` | deterministic synthetic flow generator |
 | `include/lob/lobster.hpp` | LOBSTER message-file → engine-ops parser |
 | `include/lob/tsc.hpp` | rdtsc timing + wall-clock calibration |
@@ -59,9 +60,16 @@ look like" view both engines can emit, used only by tests.
   resting can only ever *improve* the best.
 - **`consume_level()`**: fills against `level.head` (FIFO), and on full consumption
   pops the head (`level.head = maker.next; head->prev = NIL`), releases the slot,
-  erases the id. The caller (`match_asks`/`match_bids`) advances the best index with
-  a `do/while` scan when the level empties. The scan is the measured sparse-book
-  weakness — see the README's LOBSTER tail discussion.
+  erases the id. When the level empties, the caller clears the level's occupancy
+  bit and re-finds the best index via the bitmap (below) — in v1 this was a
+  one-tick-at-a-time `do/while` scan, which the LOBSTER benchmark exposed as the
+  sparse-book tail weakness.
+- **The occupancy bitmap** (`bid_bits_`/`ask_bits_`, one `uint64_t` per 64 price
+  levels): `set_bit` on rest, `clear_bit` on empty. `next_occupied_up(from)` masks
+  off bits below `from` in its word (`word & (~0ull << (from & 63))`), then walks
+  whole words using `std::countr_zero`; `next_occupied_down` mirrors it with
+  `countl_zero`. Worst case O(gap/64) with ~1ns per word — the fix that took the
+  LOBSTER p99 from 380ns (worse than the tree) to 330ns (better).
 - **`unlink_and_free()`** (cancels): classic doubly-linked unlink via pool indices —
   four cases collapse to two ternary-free branches for prev and next. Then the
   subtle part: **a cancel can empty the best level**, so if the emptied level was
@@ -70,6 +78,28 @@ look like" view both engines can emit, used only by tests.
   class of bug during development; that is what the fuzzer is *for*.
 - **`allocate()/release()`**: LIFO free list — the most recently freed slot is the
   next reused, which is also the cache-warmest.
+
+## `id_map.hpp` — the chokepoint, replaced
+
+Every submit, fill, and cancel touches the id→slot lookup, and v1's
+`std::unordered_map` paid a heap node per entry and pointer-chased buckets. The
+replacement is the standard production shape, in ~100 lines:
+
+- **Flat array of {key, value} cells**, power-of-two capacity, so probing is masked
+  add — the next probe is the next cache line, not a random pointer.
+- **Fibonacci hashing** (`id * 0x9E3779B97F4A7C15 >> 32`): exchanges hand out ids
+  sequentially, and multiplicative hashing scatters exactly that pattern.
+- **Backward-shift deletion** — the part worth being able to whiteboard. Tombstones
+  make probe chains grow forever under churn (and an order book is nothing but
+  churn); backward-shift instead walks forward from the hole and pulls each cell
+  back iff doing so shortens (or keeps) its probe distance:
+  `((probe - ideal) & mask) >= ((probe - hole) & mask)`. The table ends every erase
+  as clean as if the key had never been inserted.
+- Key 0 is the empty sentinel, so the engine's ids must be nonzero (asserted; the
+  LOBSTER parser skips id-0 rows, which the format uses for hidden orders anyway).
+- Trust is earned differentially, like everything else here: a 200k-op randomized
+  churn test against `std::unordered_map`, plus a cluster-deletion test that
+  targets the classic backward-shift bug.
 
 ## `flow.hpp` — deterministic randomness
 
@@ -121,11 +151,12 @@ precedes both modes; the process pins itself to core 0
 
 ## Likely grilling, implementation level
 
-- *Why is the ladder scan "amortised"?* Each ladder slot between two occupied
-  levels is walked at most once per time the gap is crossed; on dense books gaps
-  are ~1 tick. The LOBSTER measurement shows what happens when they aren't — that's
-  the honest counterexample, and the bitmap-summary fix (scan 64 ticks per tzcnt)
-  is named.
+- *Why was the v1 ladder scan a tail problem and not a median problem?* Most ops
+  never trigger a best-level rescan (cancels off the touch, resting submits); the
+  scan only fires when the best level empties, which is rare — so it lives in the
+  p99, not the p50. That's also why the bitmap barely moved the median but fixed
+  the tail: it attacks exactly the rare-path cost. Percentiles localise *where* a
+  cost lives; averages would have hidden this entirely.
 - *Why uint32 pool indices instead of pointers?* Half the size (more nodes per
   cache line), stable across pool growth (`vector` may reallocate; indices survive,
   pointers wouldn't), and NIL is an explicit sentinel.

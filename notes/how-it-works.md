@@ -39,7 +39,8 @@ pricers; here one implementation cross-validates another.
 
 ## What makes FastBook fast
 
-Three ideas, each attacking a specific cost in MapBook:
+Five ideas — three from v1, two added in v2 after the benchmarks located the
+remaining costs:
 
 1. **Price ladder instead of a tree.** Prices are integer ticks in a bounded range,
    so levels live in a plain array indexed by `price - min_price`. Finding a level is
@@ -52,26 +53,37 @@ Three ideas, each attacking a specific cost in MapBook:
 3. **Intrusive FIFO queues.** Each order node carries prev/next pool indices; each
    ladder slot carries head/tail. Appending is O(1), and cancelling from the middle
    of a queue is O(1) — no searching, no allocator involvement.
+4. **Occupancy bitmap (v2).** One bit per price level; when a best level empties,
+   the next occupied level is found by scanning 64 ticks per `countr_zero`/
+   `countl_zero` instruction instead of one tick per loop iteration. This is what
+   fixed the sparse-book tail (below).
+5. **Open-addressed id map (v2, `id_map.hpp`).** The id→slot lookup — touched by
+   every submit, fill, and cancel — was a `std::unordered_map`: per-node allocation
+   and bucket pointer-chasing, exactly the costs everything else avoids. Replaced
+   with a flat linear-probing table using Fibonacci hashing and **backward-shift
+   deletion** (no tombstones, so lookups never degrade as the book churns).
 
-Best bid/ask are maintained as ladder indices; when the best level empties, the index
-scans toward the next occupied level. That scan is the design's honest weakness —
-see below.
+## What the benchmarks showed — and the v1 → v2 receipts
 
-## What the benchmarks showed
+v1 measured two weaknesses and reported them instead of hiding them; v2 fixed
+exactly those two things and re-measured (v1 baseline preserved in
+`results/benchmarks_v1_baseline.csv`):
 
-- **Throughput:** ~1.5× (12.2 vs 8.2 M ops/s synthetic; 10.7 vs 7.5 on the AMZN
-  replay), median of 3 pinned, warmed-up runs.
-- **Median latency:** roughly halved (p50 ~50ns vs ~90ns).
-- **The honest crossover:** on the LOBSTER replay, FastBook's p99/p99.9 are slightly
-  *worse* than MapBook's. Cause, not hand-waving: AMZN's tick is $0.0001 on a ~$224
-  stock, so occupied levels sit hundreds of empty ticks apart, and the
-  best-level-emptied rescan walks them one by one, while `std::map` steps to its
-  neighbour in O(log n). Dense synthetic books never show this; sparse real books
-  do. Fix (named, not done): a bitmap of occupied levels — one bit per tick, scan
-  64 ticks per `tzcnt` instruction.
-- **Tail spikes** (0.5–10ms max on both engines): page faults and preemption on a
-  desktop laptop. The claim is the relative comparison under identical conditions,
-  not absolute HFT numbers — stated in the README exactly that way.
+- **Throughput:** now ~2.1× (14.1 vs 6.8 M ops/s on the AMZN replay; 11.9 vs 5.5
+  synthetic), up from ~1.5× in v1.
+- **Median latency:** p50 ~30ns vs MapBook's ~100–110ns (3.3–3.7×), halved again
+  from v1's ~50–60ns.
+- **The tail, fixed with receipts:** v1's honest crossover — LOBSTER p99/p99.9
+  *worse* than MapBook because the best-level rescan walked hundreds of empty
+  $0.0001 ticks — inverted after the bitmap: p99 380 → 330ns (MapBook ~360),
+  p99.9 751 → 510ns (MapBook ~881). Because only those two changes landed between
+  the runs, the deltas are attributable.
+- **What stayed honest:** synthetic whole-replay throughput medians barely moved
+  despite every latency percentile improving — wall-clock medians over 3 runs on a
+  desktop laptop carry OS noise that million-sample latency percentiles do not.
+  Rare 0.5–10ms max spikes (page faults, preemption) remain on both engines. The
+  claim is the relative comparison under identical conditions, not absolute HFT
+  numbers — stated in the README exactly that way.
 
 ## How the LOBSTER replay works
 
@@ -108,7 +120,12 @@ differential-consistency replay.
 - *Why not benchmark with hyper-optimised flags (-O3, PGO, march=native)?* -O2 is
   the honest default; the comparison is between designs, and both engines get the
   same flags. Flag-tuning both would shift absolute numbers, not the story.
-- *What would you do next for latency?* The bitmap level summary (kills the sparse
-  rescan), open-addressed id table (kills the unordered_map), then an SPSC-queue
-  front end and batch-drain loop — the standard single-matching-thread exchange
-  shape.
+- *Why does backward-shift deletion matter for an order book specifically?* Books
+  are pure churn — most orders are cancelled, not filled, so the id table sees
+  near-equal insert and erase rates forever. Tombstone deletion makes probe chains
+  grow monotonically under that workload; backward-shift keeps the table as clean
+  as if the erased keys had never existed.
+- *What would you do next for latency?* An SPSC-queue front end with a batch-drain
+  matching loop (the standard single-matching-thread exchange shape), huge pages
+  and locked memory for the pool and ladder, and an isolated-core Linux rig so the
+  0.5–10ms OS-noise spikes stop polluting the max.

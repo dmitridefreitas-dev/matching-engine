@@ -19,7 +19,8 @@ on every CI build.
 |---|---|---|
 | price levels | `std::map` (tree walk per lookup) | **contiguous price ladder** — one array slot per tick, level lookup is one add + one load |
 | FIFO queue per level | `std::list` (heap node per order) | **intrusive doubly-linked list** inside an **object pool** with a free list — zero steady-state allocation, O(1) mid-queue cancel |
-| best bid/ask | `map.begin()` | maintained ladder indices, advanced by amortised scan on level exhaustion |
+| best bid/ask | `map.begin()` | ladder indices re-found via an **occupancy bitmap** — 64 price ticks scanned per `countr_zero` |
+| id → order lookup | `std::unordered_map` | **open-addressed `IdMap`** — linear probing, Fibonacci hashing, backward-shift deletion (tombstone-free under churn), itself differentially tested against the STL |
 | role | visibly correct; the **oracle** | the engine being proven and measured |
 
 Same semantics contract, enforced twice over: one GoogleTest suite runs against both
@@ -48,24 +49,32 @@ fetches the file).
 
 | flow | engine | throughput (median) | p50 | p90 | p99 | p99.9 |
 |---|---|---|---|---|---|---|
-| synthetic | MapBook | 8.2 M ops/s | 90 ns | 330 ns | 951 ns | 3.3 µs |
-| synthetic | **FastBook** | **12.2 M ops/s (1.49×)** | **50 ns** | **180 ns** | **641 ns** | **2.1 µs** |
-| LOBSTER | MapBook | 7.5 M ops/s | 100 ns | 180 ns | **310 ns** | **671 ns** |
-| LOBSTER | **FastBook** | **10.7 M ops/s (1.44×)** | **60 ns** | **160 ns** | 380 ns | 751 ns |
+| synthetic | MapBook | 5.5 M ops/s | 100 ns | 350 ns | 1072 ns | 3.9 µs |
+| synthetic | **FastBook** | **11.9 M ops/s (2.16×)** | **30 ns** | **150 ns** | **460 ns** | **1.3 µs** |
+| LOBSTER | MapBook | 6.8 M ops/s | 110 ns | 190 ns | 360 ns | 881 ns |
+| LOBSTER | **FastBook** | **14.1 M ops/s (2.08×)** | **30 ns** | **120 ns** | **330 ns** | **510 ns** |
 
 ![Throughput](assets/throughput.png)
 
 ![Latency percentiles](assets/latency.png)
 
-**The honest finding is in the LOBSTER tail.** FastBook halves the median but its
-p99/p99.9 are slightly *worse* than MapBook's on the replay — measured, not hidden.
-That is the price ladder's known weakness on sparse books: AMZN ticks in $0.0001 on
-a ~$224 stock, so occupied levels sit hundreds of empty ticks apart, and when a best
-level empties the ladder scans linearly for the next occupied slot while the tree
-steps to its neighbour. Dense books never show this; wide-tick real books do. The
-standard fix — a bitmap summary of occupied levels scanned with `tzcnt` — is the
-named next step. Rare 0.5–10ms max-latency spikes on both engines are page faults
-and OS preemption on a desktop laptop; this repo's claim is the *relative*
+**Optimization, with receipts.** The first benchmarked version measured two specific
+weaknesses and reported them instead of hiding them: on the sparse LOBSTER book
+(AMZN ticks in $0.0001, so occupied levels sit hundreds of empty ticks apart) the
+best-level rescan made FastBook's p99 *worse* than MapBook's, and the
+`std::unordered_map` id lookup was a chokepoint both designs paid. Version 2 fixed
+exactly those two things — the occupancy bitmap and `IdMap` — and nothing else, so
+the deltas are attributable: LOBSTER p99 380 → 330 ns and p99.9 751 → 510 ns (both
+now *better* than the tree), p50 halved again to 30 ns, LOBSTER throughput
+10.7 → 14.1 M ops/s. The v1 baseline is preserved in
+`results/benchmarks_v1_baseline.csv`, and the differential fuzzer is what made the
+surgery safe: swap the guts, rerun, indistinguishable.
+
+![Before/after the optimizations](assets/optimization.png)
+
+Rare 0.5–10ms max-latency spikes on both engines are page faults and OS preemption
+on a desktop laptop, and whole-replay throughput medians carry more OS noise than
+the million-sample latency percentiles; this repo's claim is the *relative*
 comparison under identical conditions, not absolute HFT figures.
 
 ## Build and run
@@ -96,10 +105,9 @@ same configuration CI runs on every push (gcc + clang × Release + ASan/UBSan).
 
 - **Single-threaded matching core only** — no sessions, gateway, or persistence;
   the interesting concurrency question (SPSC queue in front of a single matching
-  thread, the standard exchange shape) is deliberately out of scope for v1.
-- **Ladder rescan on sparse books** (measured above) — bitmap level summary next.
-- **`std::unordered_map` for id→order lookup** — the honest chokepoint left in
-  both engines; open addressing keyed by dense ids is the production answer.
+  thread, the standard exchange shape) is deliberately out of scope.
+- **MapBook keeps its `std::unordered_map`** — on purpose: it is the *reference*,
+  and its job is to be obvious, not fast.
 - **No self-trade prevention, IOC/FOK, or iceberg orders** — semantics extensions
   that slot into the same differential harness.
 - LOBSTER replay synthesises aggressors from execution prints (stated in
