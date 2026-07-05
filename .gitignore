@@ -1,0 +1,16 @@
+# Build trees
+build/
+build-*/
+
+# Downloaded market data (fetch with scripts/download_lobster.py; results CSVs ARE committed)
+data/
+
+# Python / notebook tooling
+__pycache__/
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
