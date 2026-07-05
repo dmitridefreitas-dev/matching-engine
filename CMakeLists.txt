@@ -32,6 +32,7 @@ FetchContent_MakeAvailable(googletest)
 enable_testing()
 add_executable(lob_tests
     tests/test_semantics.cpp
+    tests/test_equivalence.cpp
 )
 target_link_libraries(lob_tests PRIVATE lob gtest_main)
 
